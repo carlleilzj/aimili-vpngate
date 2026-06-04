@@ -86,6 +86,12 @@ COUNTRY_TRANSLATIONS = {
     "Luxembourg": "卢森堡",
 }
 
+def _safe_int(val: Any, default: int = 0) -> int:
+    try:
+        return int(val)
+    except (ValueError, TypeError):
+        return default
+
 def get_upstream_proxy() -> tuple[str | None, str | None, int | None]:
     """
     Returns (proxy_type, host, port) from environment variables.
@@ -100,7 +106,7 @@ def get_upstream_proxy() -> tuple[str | None, str | None, int | None]:
         else:
             parts = socks_env.split(":")
             if len(parts) == 2:
-                return "socks", parts[0], int(parts[1])
+                return "socks", parts[0], _safe_int(parts[1], 10808)
             elif len(parts) == 1:
                 return "socks", parts[0], 10808
 
@@ -113,7 +119,7 @@ def get_upstream_proxy() -> tuple[str | None, str | None, int | None]:
         else:
             parts = http_env.split(":")
             if len(parts) == 2:
-                return "http", parts[0], int(parts[1])
+                return "http", parts[0], _safe_int(parts[1], 10808)
             elif len(parts) == 1:
                 return "http", parts[0], 10808
 
@@ -129,7 +135,7 @@ def get_upstream_proxy() -> tuple[str | None, str | None, int | None]:
         else:
             parts = val.split(":")
             if len(parts) == 2:
-                return "http", parts[0], int(parts[1])
+                return "http", parts[0], _safe_int(parts[1], 10808)
     return None, None, None
 
 def is_config_tcp(config_text: str) -> bool:
@@ -163,6 +169,8 @@ def parse_remote(config_text: str, fallback_ip: str = "") -> tuple[str, int, str
         elif parts[0].lower() == "remote" and len(parts) >= 3:
             remote_host = parts[1]
             remote_port = int(parts[2]) if parts[2].isdigit() else 0
+            if len(parts) >= 4:
+                proto = parts[3].lower()
     return remote_host, remote_port, proto
 
 def get_physical_interface() -> str | None:
@@ -171,14 +179,14 @@ def get_physical_interface() -> str | None:
         if res.returncode == 0:
             routes = []
             for line in res.stdout.splitlines():
-                if line.startswith("default via"):
+                if line.startswith("default"):
                     parts = line.split()
                     try:
-                        gw = parts[2]
                         dev = parts[parts.index("dev") + 1]
                         metric = 0
                         if "metric" in parts:
                             metric = int(parts[parts.index("metric") + 1])
+                        gw = parts[parts.index("via") + 1] if "via" in parts else ""
                         routes.append((gw, dev, metric))
                     except (ValueError, IndexError):
                         continue
@@ -196,8 +204,9 @@ def tcp_latency_ms(host: str, port: int, dev: str | None = None) -> int:
     started = time.time()
     # Auto-detect address family based on host address
     af = socket.AF_INET6 if ":" in host else socket.AF_INET
-    s = socket.socket(af, socket.SOCK_STREAM)
+    s = None
     try:
+        s = socket.socket(af, socket.SOCK_STREAM)
         s.settimeout(5)
         if dev:
             try:
@@ -209,10 +218,11 @@ def tcp_latency_ms(host: str, port: int, dev: str | None = None) -> int:
     except OSError:
         return 0
     finally:
-        try:
-            s.close()
-        except Exception:
-            pass
+        if s is not None:
+            try:
+                s.close()
+            except Exception:
+                pass
 
 def ping_latency_ms(host: str, port: int, fallback_ping: int = 0) -> int:
     dev = get_physical_interface()
@@ -286,8 +296,9 @@ def check_and_fix_dns() -> None:
         ("2606:4700:4700::1111", 53, socket.AF_INET6),
     ]
     for ip, port, af in dns_targets:
-        s = socket.socket(af, socket.SOCK_DGRAM)
+        s = None
         try:
+            s = socket.socket(af, socket.SOCK_DGRAM)
             s.settimeout(2)
             s.connect((ip, port))
             network_ok = True
@@ -295,10 +306,11 @@ def check_and_fix_dns() -> None:
         except Exception:
             pass
         finally:
-            try:
-                s.close()
-            except Exception:
-                pass
+            if s is not None:
+                try:
+                    s.close()
+                except Exception:
+                    pass
 
     if not network_ok:
         return
@@ -373,7 +385,11 @@ def enrich_ip_info(nodes: list[dict[str, Any]]) -> None:
         try:
             with urllib.request.urlopen(request, timeout=15) as response:
                 data = json.loads(response.read().decode("utf-8", errors="replace"))
+                if not isinstance(data, list):
+                    continue
                 for item in data:
+                    if not isinstance(item, dict):
+                        continue
                     if item.get("status") != "success":
                         continue
                     query_ip = item.get("query")
@@ -471,18 +487,20 @@ def diagnose_api_failure(api_url: str = "https://www.vpngate.net/api/iphone/") -
     # 3. 检查 TCP 连接 API 域名
     api_conn_ok = False
     api_af, api_ip = api_addr
-    s = socket.socket(api_af, socket.SOCK_STREAM)
-    s.settimeout(4)
+    s = None
     try:
+        s = socket.socket(api_af, socket.SOCK_STREAM)
+        s.settimeout(4)
         s.connect((api_ip, port))
         api_conn_ok = True
     except Exception:
         pass
     finally:
-        try:
-            s.close()
-        except Exception:
-            pass
+        if s is not None:
+            try:
+                s.close()
+            except Exception:
+                pass
 
     if not api_conn_ok:
         ext_conn_ok = False
@@ -494,19 +512,21 @@ def diagnose_api_failure(api_url: str = "https://www.vpngate.net/api/iphone/") -
             ("2606:4700:4700::1111", 53, socket.AF_INET6),
         ]
         for test_ip, test_port, af in ext_targets:
-            s = socket.socket(af, socket.SOCK_STREAM)
-            s.settimeout(3)
+            s = None
             try:
+                s = socket.socket(af, socket.SOCK_STREAM)
+                s.settimeout(3)
                 s.connect((test_ip, test_port))
                 ext_conn_ok = True
                 break
             except Exception:
                 pass
             finally:
-                try:
-                    s.close()
-                except Exception:
-                    pass
+                if s is not None:
+                    try:
+                        s.close()
+                    except Exception:
+                        pass
         if ext_conn_ok:
             return 1008, f"[ERR_API_IP_BLOCKED_OR_DOWN] 连接 API 服务器失败。原因: 外部网络连接通畅，但无法建立到 {domain} ({api_ip}:{port}) 的连接，可能是由于官方 IP 遭 GFW/防火墙 IP 阻断封锁或官方服务器宕机。"
         else:
@@ -549,18 +569,21 @@ def diagnose_local_obstructions(proxy_port: int = 7928, host: str = "127.0.0.1")
     # 1. 检查端口是否被占用
     is_ipv6 = ":" in host or host == ""
     af = socket.AF_INET6 if is_ipv6 else socket.AF_INET
-    s = socket.socket(af, socket.SOCK_STREAM)
-    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s = None
     try:
+        s = socket.socket(af, socket.SOCK_STREAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         s.bind((host, proxy_port))
     except OSError as e:
-        if e.errno == 98 or e.errno == 10048 or "already in use" in str(e).lower():
-            return 3005, f"[ERR_PORT_IN_USE] 本地代理端口 {proxy_port} 被占用。原因: 其他进程已抢占该端口，导致本系统代理网关启动失败。请运行 'lsof -i :{proxy_port}' 检查占用进程。"
+        if e.errno == 98 or e.errno == 10048 or "already in use" in str(e).lower() or "not supported" in str(e).lower():
+            if e.errno in (98, 10048) or "already in use" in str(e).lower():
+                return 3005, f"[ERR_PORT_IN_USE] 本地代理端口 {proxy_port} 被占用。原因: 其他进程已抢占该端口，导致本系统代理网关启动失败。请运行 'lsof -i :{proxy_port}' 检查占用进程。"
     finally:
-        try:
-            s.close()
-        except Exception:
-            pass
+        if s is not None:
+            try:
+                s.close()
+            except Exception:
+                pass
 
     if sys.platform.startswith("linux"):
         # 2. 检查 IPv4 转发是否开启

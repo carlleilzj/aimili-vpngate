@@ -955,9 +955,14 @@ chmod +x /usr/bin/ml
 AUTH_FILE="${INSTALL_DIR}/vpngate_data/ui_auth.json"
 mkdir -p "${INSTALL_DIR}/vpngate_data"
 
+is_custom="n"
 if [ ! -f "$AUTH_FILE" ]; then
-    echo -e "\n${YELLOW}检测到是首次安装，是否需要自定义配置网页端参数（端口/安全后缀/登录账号密码）？${PLAIN}"
-    read -p "是否自定义配置？[y/N]: " is_custom
+    if [ -t 0 ]; then
+        echo -e "\n${YELLOW}检测到是首次安装，是否需要自定义配置网页端参数（端口/安全后缀/登录账号密码）？${PLAIN}"
+        read -p "是否自定义配置？[y/N]: " is_custom
+    else
+        echo -e "\n${YELLOW}检测到是非交互式/无TTY环境安装，已自动跳过网页端参数自定义配置，采用默认随机参数部署。${PLAIN}"
+    fi
     
     # Initialize defaults
     UI_PORT=8787
@@ -1070,13 +1075,13 @@ else
     fi
     sysctl -p >/dev/null 2>&1 || true
 fi
-# Apply to currently active interfaces dynamically
-sysctl -w net.ipv4.conf.all.rp_filter=2 >/dev/null 2>&1 || true
-sysctl -w net.ipv4.conf.default.rp_filter=2 >/dev/null 2>&1 || true
+# Apply to currently active interfaces dynamically (prefer native proc write for BusyBox/Alpine compatibility)
+echo "2" > /proc/sys/net/ipv4/conf/all/rp_filter 2>/dev/null || sysctl -w net.ipv4.conf.all.rp_filter=2 >/dev/null 2>&1 || true
+echo "2" > /proc/sys/net/ipv4/conf/default/rp_filter 2>/dev/null || sysctl -w net.ipv4.conf.default.rp_filter=2 >/dev/null 2>&1 || true
 if [ -d "/proc/sys/net/ipv4/conf" ]; then
     for dev_dir in /proc/sys/net/ipv4/conf/*; do
         dev_name=$(basename "$dev_dir")
-        sysctl -w net.ipv4.conf.${dev_name}.rp_filter=2 >/dev/null 2>&1 || true
+        echo "2" > "/proc/sys/net/ipv4/conf/${dev_name}/rp_filter" 2>/dev/null || sysctl -w net.ipv4.conf.${dev_name}.rp_filter=2 >/dev/null 2>&1 || true
     done
 fi
 

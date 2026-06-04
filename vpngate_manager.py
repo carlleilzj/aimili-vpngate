@@ -329,9 +329,12 @@ def fetch_api_text_via_proxy(url: str, ptype: str, phost: str, pport: int, use_s
     if parsed.query:
         path += "?" + parsed.query
 
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.settimeout(12)
+    is_ipv6 = ":" in phost
+    af = socket.AF_INET6 if is_ipv6 else socket.AF_INET
+    s = None
     try:
+        s = socket.socket(af, socket.SOCK_STREAM)
+        s.settimeout(12)
         s.connect((phost, pport))
         if ptype == "socks":
             # SOCKS5 Handshake
@@ -390,10 +393,11 @@ def fetch_api_text_via_proxy(url: str, ptype: str, phost: str, pport: int, use_s
             if len(response_data) > 10 * 1024 * 1024: # max 10MB safety guard
                 break
     finally:
-        try:
-            s.close()
-        except Exception:
-            pass
+        if s is not None:
+            try:
+                s.close()
+            except Exception:
+                pass
 
     # Parse HTTP response
     header_end = response_data.find(b"\r\n\r\n")
@@ -830,26 +834,27 @@ def cleanup_policy_routing() -> None:
 
 def stop_active_openvpn() -> None:
     global active_openvpn_process, active_openvpn_node_id
-    cleanup_policy_routing()
-    config_to_delete = None
-    if active_openvpn_node_id:
-        nodes = read_json(NODES_FILE, [])
-        node = next((item for item in nodes if item.get("id") == active_openvpn_node_id), None)
-        if node:
-            config_to_delete = node.get("config_file")
-            
-    stop_process(active_openvpn_process)
-    active_openvpn_process = None
-    active_openvpn_node_id = ""
-    kill_existing_openvpn_processes()
-    
-    if config_to_delete:
-        try:
-            path = Path(config_to_delete)
-            if path.exists():
-                path.unlink()
-        except Exception:
-            pass
+    with lock:
+        cleanup_policy_routing()
+        config_to_delete = None
+        if active_openvpn_node_id:
+            nodes = read_json(NODES_FILE, [])
+            node = next((item for item in nodes if item.get("id") == active_openvpn_node_id), None)
+            if node:
+                config_to_delete = node.get("config_file")
+                
+        stop_process(active_openvpn_process)
+        active_openvpn_process = None
+        active_openvpn_node_id = ""
+        kill_existing_openvpn_processes()
+        
+        if config_to_delete:
+            try:
+                path = Path(config_to_delete)
+                if path.exists():
+                    path.unlink()
+            except Exception:
+                pass
 
 def active_openvpn_running() -> bool:
     return active_openvpn_process is not None and active_openvpn_process.poll() is None
@@ -914,12 +919,11 @@ def test_node_by_id(node_id: str) -> dict[str, Any]:
         ok, message, _ = run_openvpn_until_ready(config_file, keep_alive=False, route_nopull=True, timeout=12, dev=f"tun{idx}")
     finally:
         release_test_index(idx)
-    
-    try:
-        if temp_path.exists():
-            temp_path.unlink()
-    except Exception:
-        pass
+        try:
+            if temp_path.exists():
+                temp_path.unlink()
+        except Exception:
+            pass
 
     temp_node = {
         "id": node_id,
@@ -977,8 +981,20 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
         try:
             CONFIG_DIR.mkdir(exist_ok=True, parents=True)
             temp_path.write_text(config_text, encoding="utf-8")
-        except Exception:
-            pass
+        except Exception as e:
+            return {
+                "id": node_id,
+                "latency_ms": 0,
+                "probe_status": "unavailable",
+                "probe_message": f"Failed to write configuration: {e}",
+                "probed_at": time.time(),
+                "owner": "",
+                "asn": "",
+                "as_name": "",
+                "location": "",
+                "ip_type": "",
+                "quality": "",
+            }
             
         latency = vpn_utils.ping_latency_ms(h, p, fallback_ping)
         tun_idx = get_free_test_index()
@@ -987,15 +1003,17 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
             ok, message, _ = run_openvpn_until_ready(config_file, keep_alive=False, route_nopull=True, timeout=12, dev=dev_name)
         finally:
             release_test_index(tun_idx)
-        
-        try:
-            if temp_path.exists():
-                temp_path.unlink()
-        except Exception:
-            pass
+            try:
+                if temp_path.exists():
+                    temp_path.unlink()
+            except Exception:
+                pass
             
         temp_node = {
             "id": node_id,
+            "ip": n_info.get("ip") or h,
+            "remote_host": h,
+            "remote_port": p,
             "latency_ms": latency,
             "probe_status": "available" if ok else "unavailable",
             "probe_message": message,
@@ -1007,19 +1025,6 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
             "ip_type": "",
             "quality": "",
         }
-        if ok:
-            ip_to_enrich = {
-                "ip": n_info.get("ip"),
-                "remote_host": h,
-                "owner": "",
-                "asn": "",
-                "as_name": "",
-                "location": "",
-                "ip_type": "",
-                "quality": "",
-            }
-            vpn_utils.enrich_ip_info([ip_to_enrich])
-            temp_node.update(ip_to_enrich)
         return temp_node
 
     updated_nodes_map = {}
@@ -1039,6 +1044,14 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
                     "latency_ms": 0
                 }
                 
+    # 批量查询并丰富可用节点的地理及 ISP 信息，防止并发时被定位 API 接口限流
+    successful_nodes = [res for res in updated_nodes_map.values() if res.get("probe_status") == "available"]
+    if successful_nodes:
+        try:
+            vpn_utils.enrich_ip_info(successful_nodes)
+        except Exception as ee:
+            print(f"[test_multiple_nodes] 批量富化 IP 失败: {ee}", flush=True)
+
     with lock:
         current_nodes = read_json(NODES_FILE, [])
         for n in current_nodes:
@@ -1182,8 +1195,9 @@ def connect_node(node_id: str) -> str:
                 active_openvpn_node_id = ""
             raise RuntimeError(message)
             
-        active_openvpn_process = process
-        active_openvpn_node_id = node_id
+        with lock:
+            active_openvpn_process = process
+            active_openvpn_node_id = node_id
         
         set_state(active_node_latency="配置路由", last_check_message="正在配置策略路由规则与流量转发...")
         setup_policy_routing("tun0")
@@ -4099,9 +4113,10 @@ def check_proxy_health() -> dict[str, Any]:
     # 1. 检测代理服务端口是否在监听
     is_ipv6 = ":" in LOCAL_PROXY_HOST
     af = socket.AF_INET6 if is_ipv6 else socket.AF_INET
-    s = socket.socket(af, socket.SOCK_STREAM)
-    s.settimeout(1.5)
+    s = None
     try:
+        s = socket.socket(af, socket.SOCK_STREAM)
+        s.settimeout(1.5)
         connect_host = LOCAL_PROXY_HOST
         if connect_host in ("::", "0.0.0.0", ""):
             connect_host = "::1" if is_ipv6 else "127.0.0.1"
@@ -4123,10 +4138,11 @@ def check_proxy_health() -> dict[str, Any]:
             "error": f"代理服务未运行 ({diag_msg})"
         }
     finally:
-        try:
-            s.close()
-        except Exception:
-            pass
+        if s is not None:
+            try:
+                s.close()
+            except Exception:
+                pass
 
     # 2. 检测虚拟网卡 tun0 是否存在 (Linux 下)
     tun_path = Path("/sys/class/net/tun0")
@@ -4157,20 +4173,20 @@ def check_proxy_health() -> dict[str, Any]:
                 url,
                 "--max-time", "5"
             ]
-        try:
-            res = subprocess.run(cmd, capture_output=True, text=True, timeout=6)
-            if res.returncode == 0:
-                lines = res.stdout.strip().splitlines()
-                if len(lines) >= 2:
-                    ip = lines[0].strip()
-                    time_info = lines[1].strip().split()
-                    if len(time_info) == 2:
-                        total_time_str, http_code = time_info
-                        if http_code == "200" and ip:
-                            latency_ms = int(float(total_time_str) * 1000)
-                            return {"ok": True, "ip": ip, "latency_ms": latency_ms}
-        except Exception:
-            pass
+            try:
+                res = subprocess.run(cmd, capture_output=True, text=True, timeout=6)
+                if res.returncode == 0:
+                    lines = res.stdout.strip().splitlines()
+                    if len(lines) >= 2:
+                        ip = lines[0].strip()
+                        time_info = lines[1].strip().split()
+                        if len(time_info) == 2:
+                            total_time_str, http_code = time_info
+                            if http_code == "200" and ip:
+                                latency_ms = int(float(total_time_str) * 1000)
+                                return {"ok": True, "ip": ip, "latency_ms": latency_ms}
+            except Exception:
+                pass
         return None
 
     try:
@@ -4404,9 +4420,10 @@ class Handler(BaseHTTPRequestHandler):
             proxy_err = ""
             is_ipv6 = ":" in LOCAL_PROXY_HOST
             af = socket.AF_INET6 if is_ipv6 else socket.AF_INET
-            s = socket.socket(af, socket.SOCK_STREAM)
-            s.settimeout(0.5)
+            s = None
             try:
+                s = socket.socket(af, socket.SOCK_STREAM)
+                s.settimeout(0.5)
                 connect_host = LOCAL_PROXY_HOST
                 if connect_host in ("::", "0.0.0.0", ""):
                     connect_host = "::1" if is_ipv6 else "127.0.0.1"
@@ -4426,10 +4443,11 @@ class Handler(BaseHTTPRequestHandler):
                 diag = vpn_utils.diagnose_local_obstructions(LOCAL_PROXY_PORT, host=LOCAL_PROXY_HOST)
                 proxy_err = diag[1] if diag else f"本地代理网关无法连通: {e}"
             finally:
-                try:
-                    s.close()
-                except Exception:
-                    pass
+                if s is not None:
+                    try:
+                        s.close()
+                    except Exception:
+                        pass
             proxy_gateway_status = {
                 "name": "本地代理网关",
                 "status": "running" if proxy_ok else "stopped",
@@ -4797,6 +4815,12 @@ class Tee:
         self.stdout.flush()
         self.file.flush()
 
+    def isatty(self) -> bool:
+        return self.stdout.isatty()
+
+    def __getattr__(self, attr: str) -> Any:
+        return getattr(self.stdout, attr)
+
 def main() -> None:
     ensure_dirs()
     kill_existing_openvpn_processes()
@@ -4830,8 +4854,9 @@ def main() -> None:
     is_ipv6 = ":" in LOCAL_PROXY_HOST
     af = socket.AF_INET6 if is_ipv6 else socket.AF_INET
     for _ in range(30):
-        s = socket.socket(af, socket.SOCK_STREAM)
+        s = None
         try:
+            s = socket.socket(af, socket.SOCK_STREAM)
             s.settimeout(0.5)
             connect_host = LOCAL_PROXY_HOST
             if connect_host in ("::", "0.0.0.0", ""):
@@ -4855,10 +4880,11 @@ def main() -> None:
         except Exception:
             time.sleep(0.5)
         finally:
-            try:
-                s.close()
-            except Exception:
-                pass
+            if s is not None:
+                try:
+                    s.close()
+                except Exception:
+                    pass
             
     if gateway_ready:
         print("[网关] 代理网关已成功启动监听，启动同步与检测脚本...", flush=True)

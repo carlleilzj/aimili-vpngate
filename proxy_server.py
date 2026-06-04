@@ -35,24 +35,27 @@ def resolve_dns_over_tun0(host: str, dns_server: str = "8.8.8.8", timeout: float
         pass
 
     import random
-    tx_id = random.getrandbits(16).to_bytes(2, "big")
-    flags = b"\x01\x00"
-    questions = b"\x00\x01"
-    rrs = b"\x00\x00\x00\x00\x00\x00"
-
-    qname = b""
-    for part in host.split("."):
-        if not part:
-            continue
-        part_bytes = part.encode("idna")
-        qname += len(part_bytes).to_bytes(1, "big") + part_bytes
-    qname += b"\x00"
-
-    qtype_qclass = b"\x00\x01\x00\x01"
-    packet = tx_id + flags + questions + rrs + qname + qtype_qclass
-
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock = None
     try:
+        tx_id = random.getrandbits(16).to_bytes(2, "big")
+        flags = b"\x01\x00"
+        questions = b"\x00\x01"
+        rrs = b"\x00\x00\x00\x00\x00\x00"
+
+        qname = b""
+        for part in host.split("."):
+            if not part:
+                continue
+            part_bytes = part.encode("idna")
+            if len(part_bytes) > 63:
+                return None
+            qname += len(part_bytes).to_bytes(1, "big") + part_bytes
+        qname += b"\x00"
+
+        qtype_qclass = b"\x00\x01\x00\x01"
+        packet = tx_id + flags + questions + rrs + qname + qtype_qclass
+
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.settimeout(timeout)
         try:
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, b"tun0")
@@ -67,37 +70,23 @@ def resolve_dns_over_tun0(host: str, dns_server: str = "8.8.8.8", timeout: float
     except Exception:
         return None
     finally:
-        sock.close()
+        if sock is not None:
+            try:
+                sock.close()
+            except Exception:
+                pass
 
-    if len(resp) < 12:
-        return None
-    if resp[:2] != tx_id:
-        return None
+    try:
+        if len(resp) < 12:
+            return None
+        if resp[:2] != tx_id:
+            return None
 
-    rcode = resp[3] & 0x0F
-    if rcode != 0:
-        return None
+        rcode = resp[3] & 0x0F
+        if rcode != 0:
+            return None
 
-    offset = 12
-    while offset < len(resp):
-        length = resp[offset]
-        if length == 0:
-            offset += 1
-            break
-        elif (length & 0xC0) == 0xC0:
-            offset += 2
-            break
-        else:
-            offset += 1 + length
-
-    offset += 4
-    answers_count = int.from_bytes(resp[6:8], "big")
-    if answers_count == 0:
-        return None
-
-    for _ in range(answers_count):
-        if offset >= len(resp):
-            break
+        offset = 12
         while offset < len(resp):
             length = resp[offset]
             if length == 0:
@@ -108,18 +97,39 @@ def resolve_dns_over_tun0(host: str, dns_server: str = "8.8.8.8", timeout: float
                 break
             else:
                 offset += 1 + length
-        if offset + 10 > len(resp):
-            break
-        atype = int.from_bytes(resp[offset : offset + 2], "big")
-        aclass = int.from_bytes(resp[offset + 2 : offset + 4], "big")
-        rdlength = int.from_bytes(resp[offset + 8 : offset + 10], "big")
-        offset += 10
-        if offset + rdlength > len(resp):
-            break
-        if atype == 1 and aclass == 1 and rdlength == 4:
-            ip_bytes = resp[offset : offset + 4]
-            return socket.inet_ntoa(ip_bytes)
-        offset += rdlength
+
+        offset += 4
+        answers_count = int.from_bytes(resp[6:8], "big")
+        if answers_count == 0:
+            return None
+
+        for _ in range(answers_count):
+            if offset >= len(resp):
+                break
+            while offset < len(resp):
+                length = resp[offset]
+                if length == 0:
+                    offset += 1
+                    break
+                elif (length & 0xC0) == 0xC0:
+                    offset += 2
+                    break
+                else:
+                    offset += 1 + length
+            if offset + 10 > len(resp):
+                break
+            atype = int.from_bytes(resp[offset : offset + 2], "big")
+            aclass = int.from_bytes(resp[offset + 2 : offset + 4], "big")
+            rdlength = int.from_bytes(resp[offset + 8 : offset + 10], "big")
+            offset += 10
+            if offset + rdlength > len(resp):
+                break
+            if atype == 1 and aclass == 1 and rdlength == 4:
+                ip_bytes = resp[offset : offset + 4]
+                return socket.inet_ntoa(ip_bytes)
+            offset += rdlength
+    except Exception:
+        return None
     return None
 
 def create_connection(address: tuple[str, int], timeout: float = 20) -> socket.socket:
@@ -227,14 +237,35 @@ def http_client(client: socket.socket, first_byte: bytes) -> None:
             return
 
         parsed = urllib.parse.urlsplit(target)
-        if not parsed.hostname:
+        hostname = parsed.hostname
+        port = parsed.port
+        scheme = parsed.scheme
+        if not hostname:
+            # Fallback to Host header
+            for line in lines[1:]:
+                if line.lower().startswith("host:"):
+                    host_val = line.split(":", 1)[1].strip()
+                    if "[" in host_val and "]" in host_val:
+                        host_part, _, port_part = host_val.rpartition("]")
+                        hostname = host_part.lstrip("[")
+                        if port_part.startswith(":"):
+                            p_val = port_part.lstrip(":")
+                            port = int(p_val) if p_val.isdigit() else None
+                        else:
+                            port = None
+                    else:
+                        host_part, _, port_part = host_val.partition(":")
+                        hostname = host_part
+                        port = int(port_part) if port_part.isdigit() else None
+                    break
+        if not hostname:
             client.sendall(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n")
             return
-        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        port = port or (443 if scheme == "https" else 80)
         path = urllib.parse.urlunsplit(("", "", parsed.path or "/", parsed.query, ""))
         headers = [line for line in lines[1:] if not line.lower().startswith(("proxy-connection:", "connection:"))]
         request = f"{method} {path} {version}\r\n" + "\r\n".join(headers) + "\r\nConnection: close\r\n\r\n"
-        upstream = create_connection((parsed.hostname, port), timeout=20)
+        upstream = create_connection((hostname, port), timeout=20)
         upstream.sendall(request.encode("iso-8859-1") + rest)
         relay(client, upstream)
     except Exception as e:
@@ -268,6 +299,7 @@ def proxy_client(client: socket.socket, address: tuple[str, int]) -> None:
 def start_proxy_server(host: str, port: int) -> None:
     is_ipv6 = ":" in host or host == ""
     af = socket.AF_INET6 if is_ipv6 else socket.AF_INET
+    server = None
     try:
         server = socket.socket(af, socket.SOCK_STREAM)
         server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -280,7 +312,12 @@ def start_proxy_server(host: str, port: int) -> None:
         server.listen(256)
         print(f"HTTP/SOCKS5 proxy listening on {host}:{port}", flush=True)
     except Exception as e:
-        if is_ipv6 and host == "::":
+        if server is not None:
+            try:
+                server.close()
+            except Exception:
+                pass
+        if is_ipv6 and host in ("::", ""):
             print(f"[警告] 绑定 IPv6 {host}:{port} 失败 ({e})，正在尝试回退至 IPv4 0.0.0.0 ...", flush=True)
             try:
                 server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
